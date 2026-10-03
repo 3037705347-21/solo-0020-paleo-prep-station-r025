@@ -31,6 +31,7 @@ go run ./cmd/paleo-prep-station --addr 127.0.0.1:18133
 - `GET /plans/{id}`
 - `POST /plans/{id}/approval`
 - `POST /plans/{id}/progress`
+- `POST /progress/batch`
 - `POST /specimens/{id}/release`
 
 ## 本地验证
@@ -41,6 +42,7 @@ go run ./cmd/paleo-prep-station --addr 127.0.0.1:18133
 go run ./cmd/workflowcheck --workflow register-specimen
 go run ./cmd/workflowcheck --workflow approve-prep-plan
 go run ./cmd/workflowcheck --workflow log-preparation
+go run ./cmd/workflowcheck --workflow log-preparation-batch
 go run ./cmd/workflowcheck --workflow release-for-study
 ```
 

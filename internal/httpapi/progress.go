@@ -18,3 +18,16 @@ func (api *API) logProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusCreated, value)
 }
+
+func (api *API) logProgressBatch(w http.ResponseWriter, r *http.Request) {
+	var request contracts.ProgressBatchRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	values, err := api.service.LogProgressBatch(r.Context(), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"items": values})
+}

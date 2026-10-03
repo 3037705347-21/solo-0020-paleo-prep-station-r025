@@ -42,6 +42,21 @@ type releaseView struct {
 	SpecimenID string `json:"specimen_id"`
 }
 
+type progressEntryView struct {
+	ID       string `json:"id"`
+	PlanID   string `json:"plan_id"`
+	Sequence int    `json:"sequence"`
+	Percent  int    `json:"percent"`
+}
+
+type progressBatchView struct {
+	Items []progressEntryView `json:"items"`
+}
+
+type errorView struct {
+	Code string `json:"code"`
+}
+
 func main() {
 	workflow := flag.String("workflow", "", "workflow id to check")
 	flag.Parse()
@@ -61,7 +76,7 @@ func run(workflow string) error {
 
 	switch workflow {
 	case "register-specimen":
-		specimen, err := registerSpecimen(client, server.URL)
+		specimen, err := registerSpecimen(client, server.URL, "PPS-2026-001")
 		if err != nil {
 			return err
 		}
@@ -78,7 +93,7 @@ func run(workflow string) error {
 		return nil
 
 	case "approve-prep-plan":
-		specimen, err := registerSpecimen(client, server.URL)
+		specimen, err := registerSpecimen(client, server.URL, "PPS-2026-001")
 		if err != nil {
 			return err
 		}
@@ -170,19 +185,21 @@ func run(workflow string) error {
 			return fmt.Errorf("expected available specimen, got %s", fetched.Status)
 		}
 		return nil
+	case "log-preparation-batch":
+		return checkProgressBatch(client, server.URL)
 	default:
 		return fmt.Errorf("unknown workflow %q", workflow)
 	}
 }
 
-func registerSpecimen(client *http.Client, baseURL string) (specimenView, error) {
+func registerSpecimen(client *http.Client, baseURL, catalogNumber string) (specimenView, error) {
 	var specimen specimenView
 	err := requestJSON(
 		client,
 		http.MethodPost,
 		baseURL+"/specimens",
 		contracts.RegisterSpecimenRequest{
-			CatalogNumber: "PPS-2026-001",
+			CatalogNumber: catalogNumber,
 			FieldLabel:    "北坡-07",
 			TaxonHint:     "大型脊椎动物",
 			MatrixKind:    "粉砂岩",
@@ -213,7 +230,11 @@ func createPlan(client *http.Client, baseURL, specimenID string) (planView, erro
 }
 
 func completedPlanSetup(client *http.Client, baseURL string) (specimenView, planView, error) {
-	specimen, err := registerSpecimen(client, baseURL)
+	return approvedPlanSetup(client, baseURL, "PPS-2026-001")
+}
+
+func approvedPlanSetup(client *http.Client, baseURL, catalogNumber string) (specimenView, planView, error) {
+	specimen, err := registerSpecimen(client, baseURL, catalogNumber)
 	if err != nil {
 		return specimenView{}, planView{}, err
 	}
@@ -250,6 +271,192 @@ func recordProgress(client *http.Client, baseURL, planID string, percent int, st
 		http.StatusCreated,
 		&ignored,
 	)
+}
+
+func checkProgressBatch(client *http.Client, baseURL string) error {
+	specimenA, planA, err := approvedPlanSetup(client, baseURL, "PPS-2026-101")
+	if err != nil {
+		return err
+	}
+	specimenB, planB, err := approvedPlanSetup(client, baseURL, "PPS-2026-102")
+	if err != nil {
+		return err
+	}
+
+	var first progressBatchView
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "基质剥离", Percent: 40, Note: "批量首条", RecordedBy: "preparator-chen"},
+			{PlanID: planB.ID, Stage: "表面加固", Percent: 100, Note: "批量完成", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusCreated,
+		&first,
+	); err != nil {
+		return err
+	}
+	if len(first.Items) != 2 {
+		return fmt.Errorf("expected two batch entries, got %d", len(first.Items))
+	}
+	if first.Items[0].PlanID != planA.ID || first.Items[0].Sequence != 1 || first.Items[0].Percent != 40 {
+		return errors.New("first batch entry does not match plan A")
+	}
+	if first.Items[1].PlanID != planB.ID || first.Items[1].Sequence != 1 || first.Items[1].Percent != 100 {
+		return errors.New("second batch entry does not match plan B")
+	}
+	if err := expectPlanProgress(client, baseURL, planB.ID, "completed", []int{100}); err != nil {
+		return err
+	}
+	var fetchedB specimenView
+	if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimenB.ID, nil, http.StatusOK, &fetchedB); err != nil {
+		return err
+	}
+	if fetchedB.Status != "stabilized" {
+		return fmt.Errorf("expected stabilized specimen B, got %s", fetchedB.Status)
+	}
+	var fetchedA specimenView
+	if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimenA.ID, nil, http.StatusOK, &fetchedA); err != nil {
+		return err
+	}
+	if fetchedA.Status != "preparing" {
+		return fmt.Errorf("expected preparing specimen A, got %s", fetchedA.Status)
+	}
+
+	var second progressBatchView
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "围岩清理", Percent: 70, Note: "批量续录", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusCreated,
+		&second,
+	); err != nil {
+		return err
+	}
+	if len(second.Items) != 1 || second.Items[0].Sequence != 2 {
+		return errors.New("follow-up batch did not continue the sequence for plan A")
+	}
+
+	var failure errorView
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "断层扫描", Percent: 85, Note: "应整体回滚", RecordedBy: "preparator-chen"},
+			{PlanID: "plan-missing", Stage: "基质剥离", Percent: 50, Note: "未知方案", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusNotFound,
+		&failure,
+	); err != nil {
+		return err
+	}
+	if failure.Code != "plan_not_found" {
+		return fmt.Errorf("expected plan_not_found, got %s", failure.Code)
+	}
+	if err := expectPlanProgress(client, baseURL, planA.ID, "active", []int{40, 70}); err != nil {
+		return err
+	}
+
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "酸洗", Percent: 80, Note: "重复方案", RecordedBy: "preparator-chen"},
+			{PlanID: planA.ID, Stage: "加固", Percent: 90, Note: "重复方案", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusConflict,
+		&failure,
+	); err != nil {
+		return err
+	}
+	if failure.Code != "duplicate_plan_in_batch" {
+		return fmt.Errorf("expected duplicate_plan_in_batch, got %s", failure.Code)
+	}
+	if err := expectPlanProgress(client, baseURL, planA.ID, "active", []int{40, 70}); err != nil {
+		return err
+	}
+
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "酸洗", Percent: 60, Note: "比例回退", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusConflict,
+		&failure,
+	); err != nil {
+		return err
+	}
+	if failure.Code != "progress_regressed" {
+		return fmt.Errorf("expected progress_regressed, got %s", failure.Code)
+	}
+	if err := expectPlanProgress(client, baseURL, planA.ID, "active", []int{40, 70}); err != nil {
+		return err
+	}
+
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+			{PlanID: planA.ID, Stage: "加固", Percent: 90, Note: "应整体回滚", RecordedBy: "preparator-chen"},
+			{PlanID: planB.ID, Stage: "补录", Percent: 50, Note: "已完成方案", RecordedBy: "preparator-chen"},
+		}},
+		http.StatusConflict,
+		&failure,
+	); err != nil {
+		return err
+	}
+	if failure.Code != "plan_not_recordable" {
+		return fmt.Errorf("expected plan_not_recordable, got %s", failure.Code)
+	}
+	if err := expectPlanProgress(client, baseURL, planA.ID, "active", []int{40, 70}); err != nil {
+		return err
+	}
+	if err := expectPlanProgress(client, baseURL, planB.ID, "completed", []int{100}); err != nil {
+		return err
+	}
+
+	if err := requestJSON(
+		client,
+		http.MethodPost,
+		baseURL+"/progress/batch",
+		contracts.ProgressBatchRequest{},
+		http.StatusBadRequest,
+		&failure,
+	); err != nil {
+		return err
+	}
+	if failure.Code != "empty_progress_batch" {
+		return fmt.Errorf("expected empty_progress_batch, got %s", failure.Code)
+	}
+	return nil
+}
+
+func expectPlanProgress(client *http.Client, baseURL, planID, wantStatus string, wantPercents []int) error {
+	var snapshot planSnapshot
+	if err := requestJSON(client, http.MethodGet, baseURL+"/plans/"+planID, nil, http.StatusOK, &snapshot); err != nil {
+		return err
+	}
+	if snapshot.Plan.Status != wantStatus {
+		return fmt.Errorf("expected plan status %s, got %s", wantStatus, snapshot.Plan.Status)
+	}
+	if len(snapshot.Progress) != len(wantPercents) {
+		return fmt.Errorf("expected %d progress entries, got %d", len(wantPercents), len(snapshot.Progress))
+	}
+	for index, want := range wantPercents {
+		if snapshot.Progress[index].Percent != want {
+			return fmt.Errorf("progress %d expected %d%%, got %d%%", index+1, want, snapshot.Progress[index].Percent)
+		}
+	}
+	return nil
 }
 
 func requestJSON(
