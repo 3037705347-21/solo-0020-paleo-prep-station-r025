@@ -136,6 +136,130 @@ func run(workflow string) error {
 		}
 		return nil
 
+	case "log-preparation-batch":
+		specimenA, planA, err := approvedPlanSetup(client, server.URL, "PPS-2026-101")
+		if err != nil {
+			return err
+		}
+		specimenB, planB, err := approvedPlanSetup(client, server.URL, "PPS-2026-102")
+		if err != nil {
+			return err
+		}
+		var accepted struct {
+			Items []struct {
+				PlanID   string `json:"plan_id"`
+				Sequence int    `json:"sequence"`
+				Percent  int    `json:"percent"`
+			} `json:"items"`
+		}
+		if err := requestJSON(
+			client,
+			http.MethodPost,
+			server.URL+"/progress/batch",
+			contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+				{PlanID: planA.ID, Stage: "基质剥离", Percent: 40, Note: "班组批量录入", RecordedBy: "preparator-chen"},
+				{PlanID: planB.ID, Stage: "表面加固", Percent: 100, Note: "班组批量录入", RecordedBy: "preparator-chen"},
+			}},
+			http.StatusCreated,
+			&accepted,
+		); err != nil {
+			return err
+		}
+		if len(accepted.Items) != 2 || accepted.Items[0].Sequence != 1 || accepted.Items[1].Sequence != 1 {
+			return errors.New("batch did not return one first-sequence entry per plan")
+		}
+		var snapshotA planSnapshot
+		if err := requestJSON(client, http.MethodGet, server.URL+"/plans/"+planA.ID, nil, http.StatusOK, &snapshotA); err != nil {
+			return err
+		}
+		if snapshotA.Plan.Status != "active" || len(snapshotA.Progress) != 1 || snapshotA.Progress[0].Percent != 40 {
+			return errors.New("first plan did not reach active with a single 40% entry")
+		}
+		var snapshotB planSnapshot
+		if err := requestJSON(client, http.MethodGet, server.URL+"/plans/"+planB.ID, nil, http.StatusOK, &snapshotB); err != nil {
+			return err
+		}
+		if snapshotB.Plan.Status != "completed" || len(snapshotB.Progress) != 1 || snapshotB.Progress[0].Percent != 100 {
+			return errors.New("second plan did not complete with a single 100% entry")
+		}
+		var fetchedA specimenView
+		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimenA.ID, nil, http.StatusOK, &fetchedA); err != nil {
+			return err
+		}
+		if fetchedA.Status != "preparing" {
+			return fmt.Errorf("expected preparing specimen, got %s", fetchedA.Status)
+		}
+		var fetchedB specimenView
+		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimenB.ID, nil, http.StatusOK, &fetchedB); err != nil {
+			return err
+		}
+		if fetchedB.Status != "stabilized" {
+			return fmt.Errorf("expected stabilized specimen, got %s", fetchedB.Status)
+		}
+		// 批内重复方案必须整体失败。
+		if err := requestJSON(
+			client,
+			http.MethodPost,
+			server.URL+"/progress/batch",
+			contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+				{PlanID: planA.ID, Stage: "重复一", Percent: 60, Note: "重复", RecordedBy: "preparator-chen"},
+				{PlanID: planA.ID, Stage: "重复二", Percent: 70, Note: "重复", RecordedBy: "preparator-chen"},
+			}},
+			http.StatusConflict,
+			nil,
+		); err != nil {
+			return err
+		}
+		// 后段未知方案失败时，前段合法条目不得写入。
+		if err := requestJSON(
+			client,
+			http.MethodPost,
+			server.URL+"/progress/batch",
+			contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+				{PlanID: planA.ID, Stage: "薄片修整", Percent: 60, Note: "前段", RecordedBy: "preparator-chen"},
+				{PlanID: "plan-missing", Stage: "不存在", Percent: 50, Note: "后段", RecordedBy: "preparator-chen"},
+			}},
+			http.StatusNotFound,
+			nil,
+		); err != nil {
+			return err
+		}
+		// 比例回退必须整体失败。
+		if err := requestJSON(
+			client,
+			http.MethodPost,
+			server.URL+"/progress/batch",
+			contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+				{PlanID: planA.ID, Stage: "比例回退", Percent: 30, Note: "回退", RecordedBy: "preparator-chen"},
+			}},
+			http.StatusConflict,
+			nil,
+		); err != nil {
+			return err
+		}
+		// 已完成方案的终态冲突必须整体失败。
+		if err := requestJSON(
+			client,
+			http.MethodPost,
+			server.URL+"/progress/batch",
+			contracts.ProgressBatchRequest{Items: []contracts.ProgressBatchItem{
+				{PlanID: planB.ID, Stage: "终态写入", Percent: 100, Note: "终态", RecordedBy: "preparator-chen"},
+			}},
+			http.StatusConflict,
+			nil,
+		); err != nil {
+			return err
+		}
+		// 上述失败都不得留下部分进度。
+		var after planSnapshot
+		if err := requestJSON(client, http.MethodGet, server.URL+"/plans/"+planA.ID, nil, http.StatusOK, &after); err != nil {
+			return err
+		}
+		if after.Plan.Status != "active" || len(after.Progress) != 1 || after.Progress[0].Percent != 40 {
+			return errors.New("failed batches left partial progress behind")
+		}
+		return nil
+
 	case "release-for-study":
 		specimen, plan, err := completedPlanSetup(client, server.URL)
 		if err != nil {
@@ -176,13 +300,17 @@ func run(workflow string) error {
 }
 
 func registerSpecimen(client *http.Client, baseURL string) (specimenView, error) {
+	return registerSpecimenWithCatalog(client, baseURL, "PPS-2026-001")
+}
+
+func registerSpecimenWithCatalog(client *http.Client, baseURL, catalogNumber string) (specimenView, error) {
 	var specimen specimenView
 	err := requestJSON(
 		client,
 		http.MethodPost,
 		baseURL+"/specimens",
 		contracts.RegisterSpecimenRequest{
-			CatalogNumber: "PPS-2026-001",
+			CatalogNumber: catalogNumber,
 			FieldLabel:    "北坡-07",
 			TaxonHint:     "大型脊椎动物",
 			MatrixKind:    "粉砂岩",
@@ -213,7 +341,11 @@ func createPlan(client *http.Client, baseURL, specimenID string) (planView, erro
 }
 
 func completedPlanSetup(client *http.Client, baseURL string) (specimenView, planView, error) {
-	specimen, err := registerSpecimen(client, baseURL)
+	return approvedPlanSetup(client, baseURL, "PPS-2026-001")
+}
+
+func approvedPlanSetup(client *http.Client, baseURL, catalogNumber string) (specimenView, planView, error) {
+	specimen, err := registerSpecimenWithCatalog(client, baseURL, catalogNumber)
 	if err != nil {
 		return specimenView{}, planView{}, err
 	}

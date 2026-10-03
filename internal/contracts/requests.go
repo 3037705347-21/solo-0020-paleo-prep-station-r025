@@ -26,6 +26,18 @@ type ProgressRequest struct {
 	RecordedBy string `json:"recorded_by"`
 }
 
+type ProgressBatchItem struct {
+	PlanID     string `json:"plan_id"`
+	Stage      string `json:"stage"`
+	Percent    int    `json:"percent"`
+	Note       string `json:"note"`
+	RecordedBy string `json:"recorded_by"`
+}
+
+type ProgressBatchRequest struct {
+	Items []ProgressBatchItem `json:"items"`
+}
+
 type ReleaseRequest struct {
 	Purpose    string `json:"purpose"`
 	Recipient  string `json:"recipient"`
